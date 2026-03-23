@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "/Users/bryantran/.bun/bin/bun",
+      "args": [
+        "run",
+        "/Users/bryantran/informatik/whatsapp-mcp/whatsapp-channel/index.ts"
+      ]
+    },
+    "whatsapp-data": {
+      "command": "/Users/bryantran/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/Users/bryantran/informatik/whatsapp-mcp/whatsapp-mcp-server",
+        "run",
+        "main.py"
+      ]
+    }
+  }
+}
