@@ -1,7 +1,8 @@
 import sqlite3
+import time
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
 import requests
 import json
@@ -765,3 +766,523 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def resync_chats(chat_jid: Optional[str] = None, count: int = 100) -> Dict[str, Any]:
+    """Resync message history from WhatsApp servers.
+
+    Two modes:
+    - No chat_jid: FULL resync — clears DB, reconnects, WhatsApp re-pushes all history.
+    - With chat_jid: On-demand — requests older messages for a specific chat.
+
+    Args:
+        chat_jid: Optional. Specific chat to fetch older messages for.
+        count: Number of messages to request (default: 100). Only for on-demand mode.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/resync"
+        payload = {}
+        if chat_jid:
+            payload["chat_jid"] = chat_jid
+            payload["count"] = count
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_events(
+    chat_jid: str,
+    after_timestamp: Optional[str] = None,
+    event_types: Optional[List[str]] = None,
+    limit: int = 50
+) -> List[Dict[str, Any]]:
+    """Get events (read receipts, typing indicators) for a chat.
+
+    Args:
+        chat_jid: The JID of the chat.
+        after_timestamp: Only return events after this ISO timestamp.
+        event_types: Filter by event types (e.g. ['read', 'typing', 'delivered']).
+        limit: Max events to return.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        query = "SELECT id, chat_jid, event_type, sender, timestamp, data FROM events WHERE chat_jid = ?"
+        params = [chat_jid]
+
+        if after_timestamp:
+            query += " AND timestamp > ?"
+            params.append(after_timestamp)
+
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            query += f" AND event_type IN ({placeholders})"
+            params.extend(event_types)
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+
+        events = []
+        for row in rows:
+            events.append({
+                "id": row[0],
+                "chat_jid": row[1],
+                "event_type": row[2],
+                "sender": row[3],
+                "timestamp": row[4],
+                "data": row[5],
+            })
+        return events
+
+    except sqlite3.Error as e:
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def mark_read(chat_jid: str, message_ids: List[str]) -> Dict[str, Any]:
+    """Send read receipt (blue ticks) for specific messages. MANUAL ONLY.
+
+    By default, we NEVER send read receipts. Call this explicitly when you
+    want them to see blue ticks. Pure psychological warfare.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/mark-read"
+        payload = {"chat_jid": chat_jid, "message_ids": message_ids}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def send_typing(chat_jid: str, composing: bool = True, media: str = "text") -> Dict[str, Any]:
+    """Send typing indicator. Show as typing or stop typing.
+
+    Args:
+        chat_jid: The chat to show typing in.
+        composing: True = start typing, False = stop typing.
+        media: "text" or "audio" (recording voice message indicator).
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/typing"
+        payload = {"chat_jid": chat_jid, "composing": composing, "media": media}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def set_presence(available: bool = True) -> Dict[str, Any]:
+    """Set online/offline presence.
+
+    Args:
+        available: True = appear online, False = appear offline.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence"
+        payload = {"available": available}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_chat_log(
+    chat_jid: str,
+    amount: int = 50,
+    offset: int = 0
+) -> Dict[str, Any]:
+    """Get conversation as a readable chat log optimized for LLM analysis.
+
+    Returns messages as plain-text chronological log, ~5x smaller than JSON.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        # Get chat name
+        cursor.execute("SELECT name FROM chats WHERE jid = ?", (chat_jid,))
+        chat_result = cursor.fetchone()
+        chat_name = chat_result[0] if chat_result else chat_jid
+
+        # Fetch messages (newest first, then reverse for chronological)
+        cursor.execute("""
+            SELECT m.sender, m.content, m.timestamp, m.is_from_me, m.media_type, m.id
+            FROM messages m
+            WHERE m.chat_jid = ?
+            ORDER BY m.timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (chat_jid, amount, offset))
+
+        messages = cursor.fetchall()
+        has_more = len(messages) >= amount
+
+        # Reverse to chronological order (oldest first)
+        messages.reverse()
+
+        lines = []
+        for msg in messages:
+            sender_raw, content, timestamp, is_from_me, media_type, msg_id = msg
+
+            sender = "YOU" if is_from_me else (get_sender_name(sender_raw) if sender_raw else "Unknown")
+
+            # Trim timestamp to YYYY-MM-DD HH:MM
+            ts = timestamp[:16] if timestamp else ""
+
+            text = content or ""
+            if media_type:
+                media_tag = f"[{media_type}: msg_id={msg_id}, chat_jid={chat_jid}]"
+                text = f"{media_tag} {text}" if text else media_tag
+
+            if text:
+                lines.append(f"[{ts}] {sender}: {text}")
+
+        log_text = "\n".join(lines)
+
+        return {
+            "chat_jid": chat_jid,
+            "chat_name": chat_name,
+            "log": log_text,
+            "count": len(lines),
+            "offset": offset,
+            "has_more": has_more,
+        }
+
+    except sqlite3.Error as e:
+        return {"error": str(e)}
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def wait_for_reply(
+    chat_jid: str,
+    timeout_minutes: int = 5,
+    double_text_grace_period_seconds: int = 10
+) -> Dict[str, Any]:
+    """Block until a new message arrives in the chat or timeout.
+
+    Polls the SQLite database for new messages (the Go bridge writes
+    messages in real-time as they arrive from WhatsApp).
+
+    Args:
+        chat_jid: The JID of the chat to monitor.
+        timeout_minutes: How long to wait before returning (default: 5).
+        double_text_grace_period_seconds: Extra wait after first reply
+            to catch rapid follow-up messages (default: 10).
+
+    Returns:
+        On reply: dict with 'success', 'new_messages' array, 'waited_seconds'.
+        On timeout: dict with 'timeout', 'waited_seconds'.
+    """
+    start_time = time.time()
+    timeout_seconds = timeout_minutes * 60
+    deadline = start_time + timeout_seconds
+
+    # Get the current latest message timestamp as our baseline
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?",
+            (chat_jid,)
+        )
+        result = cursor.fetchone()
+        baseline_timestamp = result[0] if result and result[0] else datetime.now().isoformat()
+    except sqlite3.Error:
+        baseline_timestamp = datetime.now().isoformat()
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    collected_ids = set()
+    messages = []
+    manual_activity = []  # outgoing messages not sent by MCP (manual phone usage)
+    last_message_time = None  # rolling: resets on every new message
+
+    while time.time() < deadline:
+        # Rolling grace period: wait N seconds after the LAST message, not the first
+        if (
+            last_message_time is not None
+            and time.time() - last_message_time >= double_text_grace_period_seconds
+        ):
+            break
+
+        try:
+            conn = sqlite3.connect(MESSAGES_DB_PATH)
+            cursor = conn.cursor()
+
+            # Check for incoming messages
+            cursor.execute("""
+                SELECT m.id, m.sender, m.content, m.timestamp, m.media_type
+                FROM messages m
+                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 0
+                ORDER BY m.timestamp ASC
+            """, (chat_jid, baseline_timestamp))
+
+            new_rows = cursor.fetchall()
+
+            # Also check for outgoing messages (manual activity detection)
+            cursor.execute("""
+                SELECT m.id, m.content, m.timestamp, m.media_type
+                FROM messages m
+                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 1
+                ORDER BY m.timestamp ASC
+            """, (chat_jid, baseline_timestamp))
+
+            outgoing_rows = cursor.fetchall()
+            conn.close()
+
+            for row in new_rows:
+                msg_id, sender, content, timestamp, media_type = row
+                if msg_id not in collected_ids:
+                    collected_ids.add(msg_id)
+                    d = {
+                        "sender": get_sender_name(sender) if sender else "Unknown",
+                        "text": content or "",
+                        "timestamp": timestamp,
+                    }
+                    if media_type:
+                        d["media_type"] = media_type
+                    messages.append(d)
+
+                    # Rolling: reset timer on every new message
+                    last_message_time = time.time()
+
+            for row in outgoing_rows:
+                msg_id, content, timestamp, media_type = row
+                if msg_id not in collected_ids:
+                    collected_ids.add(msg_id)
+                    d = {
+                        "text": content or "",
+                        "timestamp": timestamp,
+                        "is_from_me": True,
+                    }
+                    if media_type:
+                        d["media_type"] = media_type
+                    manual_activity.append(d)
+
+                    # Also reset grace timer on manual activity
+                    last_message_time = time.time()
+
+        except sqlite3.Error:
+            pass
+
+        time.sleep(1)
+
+    waited = int(time.time() - start_time)
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Check for read/typing events during the wait
+    seen = False
+    typing = False
+    try:
+        evts = get_events(chat_jid, after_timestamp=baseline_timestamp, event_types=["read", "typing"])
+        for evt in evts:
+            if evt["event_type"] == "read":
+                seen = True
+            elif evt["event_type"] == "typing":
+                typing = True
+    except Exception:
+        pass
+
+    if not messages and not manual_activity:
+        result = {
+            "timeout": True,
+            "waited_seconds": waited,
+            "current_time": now_str,
+        }
+    else:
+        result = {
+            "success": True,
+            "new_messages": messages,
+            "waited_seconds": waited,
+            "current_time": now_str,
+        }
+
+    if manual_activity:
+        result["manual_activity"] = manual_activity
+        result["manual_activity_warning"] = "User is actively typing on their phone. DO NOT send messages until they stop."
+    if seen:
+        result["seen"] = True
+    if typing:
+        result["typing"] = True
+
+    return result
+
+
+def send_and_check(
+    recipient: str,
+    message: str,
+    sync_timeout_seconds: int = 15
+) -> Dict[str, Any]:
+    """Send a message and check for interjections. Use for natural double-texting.
+
+    Combines three operations atomically:
+    1. Record baseline (current latest message)
+    2. Send your message
+    3. Check if they sent anything while you were typing/sending
+
+    Args:
+        recipient: Phone number or JID to send to.
+        message: Message text to send.
+        sync_timeout_seconds: Max time to wait for interjection check (default: 15).
+
+    Returns:
+        success: Whether message was sent.
+        has_interjection: True if they sent something since you started.
+        interjection: Their message if has_interjection.
+    """
+    BASE_WINDOW = 3
+    ABSOLUTE_CAP = min(sync_timeout_seconds, 15)
+
+    # Determine chat_jid from recipient
+    if '@' in recipient:
+        chat_jid = recipient
+    else:
+        chat_jid = f"{recipient}@s.whatsapp.net"
+
+    # Record baseline BEFORE sending
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?",
+            (chat_jid,)
+        )
+        result = cursor.fetchone()
+        baseline_timestamp = result[0] if result and result[0] else datetime.now().isoformat()
+        conn.close()
+    except sqlite3.Error:
+        baseline_timestamp = datetime.now().isoformat()
+
+    # Send the message
+    success, status_message = send_message(recipient, message)
+    if not success:
+        return {"success": False, "error": status_message}
+
+    # Check for interjections in a short window
+    # Smart deadline extension: +2s if they read, +5s if they start typing
+    SEEN_GRACE = 2
+    TYPING_EXTEND = 5
+
+    now = time.time()
+    check_deadline = now + BASE_WINDOW
+    cap = now + ABSOLUTE_CAP
+    interjection = None
+    seen = False
+    typing = False
+
+    while time.time() < check_deadline:
+        # Check for messages
+        try:
+            conn = sqlite3.connect(MESSAGES_DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT m.sender, m.content, m.timestamp, m.media_type
+                FROM messages m
+                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 0
+                ORDER BY m.timestamp ASC
+                LIMIT 1
+            """, (chat_jid, baseline_timestamp))
+
+            msg_result = cursor.fetchone()
+            conn.close()
+
+            if msg_result:
+                interjection = {
+                    "sender": get_sender_name(msg_result[0]) if msg_result[0] else "Unknown",
+                    "text": msg_result[1] or "",
+                    "timestamp": msg_result[2],
+                }
+                if msg_result[3]:
+                    interjection["media_type"] = msg_result[3]
+                break
+
+        except sqlite3.Error:
+            pass
+
+        # Check for read/typing events — extend deadline
+        try:
+            evts = get_events(chat_jid, after_timestamp=baseline_timestamp, event_types=["read", "typing"])
+            for evt in evts:
+                if evt["event_type"] == "read" and not seen:
+                    seen = True
+                    check_deadline = min(time.time() + SEEN_GRACE, cap)
+                elif evt["event_type"] == "typing" and not typing:
+                    typing = True
+                    check_deadline = min(time.time() + TYPING_EXTEND, cap)
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    result = {
+        "success": True,
+        "has_interjection": interjection is not None,
+        "current_time": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    if interjection:
+        result["interjection"] = interjection
+    if seen:
+        result["seen"] = True
+    if typing:
+        result["typing"] = True
+
+    return result
+
+
+def transcribe_audio(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Download and transcribe a voice/audio message using OpenAI Whisper.
+
+    Args:
+        message_id: The ID of the message containing the audio.
+        chat_jid: The JID of the chat containing the message.
+
+    Returns:
+        dict with 'success', 'text' (transcription), 'file_path', etc.
+    """
+    # First download the media
+    file_path = download_media(message_id, chat_jid)
+    if not file_path:
+        return {"success": False, "error": "Failed to download audio. Check message_id and chat_jid."}
+
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+
+        with open(file_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+            )
+
+        return {
+            "success": True,
+            "text": transcription.text,
+            "file_path": file_path,
+            "message_id": message_id,
+            "chat_jid": chat_jid,
+        }
+    except ImportError:
+        return {
+            "success": False,
+            "error": "OpenAI package not installed. Run: uv add openai",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}

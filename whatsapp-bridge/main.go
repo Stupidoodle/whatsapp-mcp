@@ -84,6 +84,15 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_jid TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			sender TEXT,
+			timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			data TEXT
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -203,7 +212,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,10 +371,43 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Store sent message in DB immediately (echo from WhatsApp is unreliable)
+	if messageStore != nil {
+		chatJID := recipientJID.String()
+		sender := ""
+		if client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg)
+
+		storeErr := messageStore.StoreMessage(
+			resp.ID,
+			chatJID,
+			sender,
+			message,
+			resp.Timestamp,
+			true, // is_from_me
+			mediaType,
+			filename,
+			url,
+			mediaKey,
+			fileSHA256,
+			fileEncSHA256,
+			fileLength,
+		)
+		if storeErr != nil {
+			fmt.Printf("Warning: failed to store sent message: %v\n", storeErr)
+		}
+
+		// Update chat's last message time
+		messageStore.StoreChat(chatJID, "", resp.Timestamp)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -590,8 +632,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file, using messageID to ensure uniqueness
+	// (multiple audio messages synced in the same second get the same filename)
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, messageID, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -641,7 +684,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -706,7 +749,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -774,6 +817,208 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for sending read receipts (blue ticks) — MANUAL ONLY
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			http.Error(w, "chat_jid and message_ids required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Convert string IDs to MessageID type
+		msgIDs := make([]types.MessageID, len(req.MessageIDs))
+		for i, id := range req.MessageIDs {
+			msgIDs[i] = types.MessageID(id)
+		}
+
+		err = client.MarkRead(context.Background(), msgIDs, time.Now(), chatJID, types.EmptyJID, "")
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Read receipt sent (blue ticks visible to them now)"})
+	})
+
+	// Handler for typing indicators — fake typing on demand
+	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req TypingRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		state := types.ChatPresencePaused
+		if req.Composing {
+			state = types.ChatPresenceComposing
+		}
+
+		media := types.ChatPresenceMediaText
+		if req.Media == "audio" {
+			media = types.ChatPresenceMediaAudio
+		}
+
+		err = client.SendChatPresence(context.Background(), chatJID, state, media)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
+		action := "stopped typing"
+		if req.Composing {
+			action = "typing"
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Now showing as %s", action)})
+	})
+
+	// Handler for online/offline presence
+	http.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req PresenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		presence := types.PresenceUnavailable
+		if req.Available {
+			presence = types.PresenceAvailable
+		}
+
+		err := client.SendPresence(context.Background(), presence)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
+		status := "offline"
+		if req.Available {
+			status = "online"
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Now appearing %s", status)})
+	})
+
+	// Handler for requesting on-demand history sync for a specific chat
+	http.HandleFunc("/api/resync", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if client == nil || !client.IsConnected() || client.Store == nil || client.Store.ID == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Not connected to WhatsApp"})
+			return
+		}
+
+		// Parse optional chat_jid from request body
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			Count   int    `json:"count"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if req.ChatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "chat_jid is required. On-demand sync only works per-chat."})
+			return
+		}
+
+		// On-demand sync for specific chat: find oldest message and request more
+		if req.Count == 0 {
+			req.Count = 100
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+
+		// Get oldest message in this chat from our DB
+		var msgID string
+		var isFromMe bool
+		var timestamp int64
+		err = messageStore.db.QueryRow(
+			"SELECT id, is_from_me, strftime('%s', timestamp) FROM messages WHERE chat_jid = ? ORDER BY timestamp ASC LIMIT 1",
+			req.ChatJID,
+		).Scan(&msgID, &isFromMe, &timestamp)
+
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "No messages found for this chat to sync from"})
+			return
+		}
+
+		msgInfo := &types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chatJID,
+				IsFromMe: isFromMe,
+			},
+			ID:        msgID,
+			Timestamp: time.Unix(timestamp, 0),
+		}
+
+		historyMsg := client.BuildHistorySyncRequest(msgInfo, req.Count)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err = client.SendPeerMessage(ctx, historyMsg)
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed: %v", err)})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Requested %d older messages for %s. They'll arrive in the background.", req.Count, req.ChatJID)})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -784,6 +1029,99 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+// Store an event in the database
+func (store *MessageStore) StoreEvent(chatJID, eventType, sender, data string) error {
+	_, err := store.db.Exec(
+		"INSERT INTO events (chat_jid, event_type, sender, timestamp, data) VALUES (?, ?, ?, ?, ?)",
+		chatJID, eventType, sender, time.Now().Format(time.RFC3339), data,
+	)
+	return err
+}
+
+// Handle receipt events (read, delivered, played)
+func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, receipt *events.Receipt, logger waLog.Logger) {
+	chatJID := receipt.Chat.String()
+	sender := receipt.Sender.User
+
+	// Filter out self-receipts (our own devices reading/playing messages)
+	if client.Store.ID != nil && sender == client.Store.ID.User {
+		logger.Infof("SELF RECEIPT (ignored): %s in %s (type: %s)", sender, chatJID, receipt.Type)
+		return
+	}
+
+	var eventType string
+	switch receipt.Type {
+	case types.ReceiptTypeRead:
+		eventType = "read"
+		logger.Infof("READ RECEIPT: %s read messages in %s", sender, chatJID)
+	case types.ReceiptTypeDelivered:
+		eventType = "delivered"
+		logger.Infof("DELIVERY RECEIPT: messages delivered to %s in %s", sender, chatJID)
+	case types.ReceiptTypePlayed:
+		eventType = "played"
+		logger.Infof("PLAYED RECEIPT: %s played voice message in %s", sender, chatJID)
+	case types.ReceiptTypeReadSelf:
+		return // Always ignore self-reads
+	case types.ReceiptTypePlayedSelf:
+		return // Always ignore self-plays
+	default:
+		return
+	}
+
+	// Store message IDs as JSON
+	msgIDs, _ := json.Marshal(receipt.MessageIDs)
+	err := messageStore.StoreEvent(chatJID, eventType, sender, string(msgIDs))
+	if err != nil {
+		logger.Warnf("Failed to store receipt event: %v", err)
+	}
+}
+
+// Handle typing indicator events
+func handleChatPresence(messageStore *MessageStore, presence *events.ChatPresence, logger waLog.Logger) {
+	chatJID := presence.Chat.String()
+	sender := presence.Sender.User
+
+	var eventType string
+	switch presence.State {
+	case types.ChatPresenceComposing:
+		eventType = "typing"
+		logger.Infof("TYPING: %s is typing in %s", sender, chatJID)
+	case types.ChatPresencePaused:
+		eventType = "typing_stopped"
+		logger.Infof("TYPING STOPPED: %s stopped typing in %s", sender, chatJID)
+	default:
+		return
+	}
+
+	mediaType := "text"
+	if presence.Media == types.ChatPresenceMediaAudio {
+		mediaType = "audio"
+	}
+
+	err := messageStore.StoreEvent(chatJID, eventType, sender, mediaType)
+	if err != nil {
+		logger.Warnf("Failed to store typing event: %v", err)
+	}
+}
+
+// MarkReadRequest for the mark-read API
+type MarkReadRequest struct {
+	ChatJID    string   `json:"chat_jid"`
+	MessageIDs []string `json:"message_ids"`
+}
+
+// TypingRequest for the typing API
+type TypingRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	Composing bool   `json:"composing"`
+	Media     string `json:"media"` // "text" or "audio"
+}
+
+// PresenceRequest for the presence API
+type PresenceRequest struct {
+	Available bool `json:"available"`
 }
 
 func main() {
@@ -800,14 +1138,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -834,19 +1172,34 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Setup event handling for messages and history sync
+	// STEALTH MODE: Don't auto-send active delivery receipts
+	// This means their messages won't show double grey ticks immediately
+	client.SetForceActiveDeliveryReceipts(false)
+
+	// Setup event handling for messages, receipts, typing, and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
+			// Process regular messages (do NOT auto-send read receipts)
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
+		case *events.Receipt:
+			// Store receipt events (read, delivered, played) — filters out self-receipts
+			handleReceipt(client, messageStore, v, logger)
+
+		case *events.ChatPresence:
+			// Store typing indicators
+			handleChatPresence(messageStore, v, logger)
+
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// STEALTH: Do NOT auto-send PresenceAvailable
+			// This keeps delivery receipts as "inactive" (no grey double ticks for them)
+			// Use /api/presence to go online manually when you want typing indicators
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
@@ -928,9 +1281,20 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
-		return existingName
+		// Check if the stored name is a real name or just a raw number/LID
+		// If it's all digits, it's probably an unresolved LID — try to resolve again
+		isRawNumber := true
+		for _, c := range existingName {
+			if c < '0' || c > '9' {
+				isRawNumber = false
+				break
+			}
+		}
+		if !isRawNumber {
+			logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
+			return existingName
+		}
+		logger.Infof("Stored name for %s looks like raw ID (%s), trying to resolve...", chatJID, existingName)
 	}
 
 	// Need to determine chat name
@@ -973,7 +1337,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,10 +1351,14 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		// Try all available name sources: FullName > PushName > BusinessName > sender > JID
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
+		} else if err == nil && contact.BusinessName != "" {
+			name = contact.BusinessName
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
@@ -1000,6 +1368,12 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		}
 
 		logger.Infof("Using contact name: %s", name)
+	}
+
+	// If we resolved a better name than what's in the DB, update it
+	if name != "" && name != existingName {
+		messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, chatJID)
+		logger.Infof("Updated chat name for %s: %s → %s", chatJID, existingName, name)
 	}
 
 	return name
