@@ -413,13 +413,29 @@ def search_contacts(query: str) -> List[Contact]:
         """, (search_pattern, search_pattern))
         
         contacts = cursor.fetchall()
-        
+
+        # Load LID-to-phone mapping for resolving real phone numbers
+        lid_map = {}
+        try:
+            wa_db_path = os.path.join(os.path.dirname(MESSAGES_DB_PATH), 'whatsapp.db')
+            wa_conn = sqlite3.connect(wa_db_path)
+            wa_cursor = wa_conn.cursor()
+            wa_cursor.execute("SELECT lid, pn FROM whatsmeow_lid_map")
+            for lid, pn in wa_cursor.fetchall():
+                lid_map[lid] = pn
+            wa_conn.close()
+        except sqlite3.Error:
+            pass
+
         result = []
         for contact_data in contacts:
+            jid = contact_data[0]
+            lid_part = jid.split('@')[0]
+            phone = lid_map.get(lid_part, lid_part) if '@lid' in jid else lid_part
             contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
+                phone_number=phone,
                 name=contact_data[1],
-                jid=contact_data[0]
+                jid=jid
             )
             result.append(contact)
             
@@ -894,6 +910,23 @@ def set_presence(available: bool = True) -> Dict[str, Any]:
         url = f"{WHATSAPP_API_BASE_URL}/presence"
         payload = {"available": available}
         response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "error": f"HTTP {response.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def resolve_contacts() -> Dict[str, Any]:
+    """Bulk-resolve all unresolved contact names.
+
+    LID-based contacts often have numeric-only names. This triggers
+    the Go bridge to look up real names (PushName/FullName) for all
+    unresolved contacts at once. Run this once before searching contacts.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/resolve-contacts"
+        response = requests.post(url)
         if response.status_code == 200:
             return response.json()
         return {"success": False, "error": f"HTTP {response.status_code}"}

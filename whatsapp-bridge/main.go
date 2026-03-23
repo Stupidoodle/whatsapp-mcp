@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,26 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+}
+
+// SSE pub/sub: connected clients and broadcast
+var (
+	sseClients = make(map[chan []byte]struct{})
+	sseMu      sync.Mutex
+)
+
+func broadcastEvent(eventType string, data map[string]interface{}) {
+	payload, _ := json.Marshal(data)
+	event := fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, payload)
+	sseMu.Lock()
+	defer sseMu.Unlock()
+	for ch := range sseClients {
+		select {
+		case ch <- []byte(event):
+		default:
+			// Client too slow, skip (non-blocking)
+		}
+	}
 }
 
 // Database handler for storing message history
@@ -509,6 +530,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Broadcast to SSE subscribers
+		broadcastEvent("message", map[string]interface{}{
+			"chat_jid":    chatJID,
+			"sender":      sender,
+			"sender_name": name,
+			"content":     content,
+			"message_id":  msg.Info.ID,
+			"timestamp":   msg.Info.Timestamp.Format(time.RFC3339),
+			"is_from_me":  msg.Info.IsFromMe,
+			"media_type":  mediaType,
+			"filename":    filename,
+		})
 	}
 }
 
@@ -1019,6 +1053,117 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Requested %d older messages for %s. They'll arrive in the background.", req.Count, req.ChatJID)})
 	})
 
+	// Bulk-resolve all unresolved contact names (LIDs with numeric-only names)
+	http.HandleFunc("/api/resolve-contacts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if client == nil || !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Not connected"})
+			return
+		}
+
+		logger := waLog.Stdout("Resolve", "INFO", true)
+
+		// Find chats with numeric-only names that have recent messages (last 30 days)
+		rows, err := messageStore.db.Query(`
+			SELECT DISTINCT c.jid, c.name FROM chats c
+			INNER JOIN messages m ON m.chat_jid = c.jid
+			WHERE c.name IS NOT NULL
+			AND m.timestamp > datetime('now', '-30 days')
+		`)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+
+		// Collect unresolved JIDs first, then close cursor before writing
+		type unresolvedChat struct{ jid, name string }
+		var toResolve []unresolvedChat
+		for rows.Next() {
+			var jidStr, name string
+			rows.Scan(&jidStr, &name)
+			isRaw := true
+			for _, c := range name {
+				if c < '0' || c > '9' {
+					isRaw = false
+					break
+				}
+			}
+			if !isRaw || name == "" {
+				continue
+			}
+			toResolve = append(toResolve, unresolvedChat{jidStr, name})
+		}
+		rows.Close()
+
+		// Now resolve with no open cursor blocking writes
+		resolved := 0
+		total := len(toResolve)
+		for _, chat := range toResolve {
+			jid, err := types.ParseJID(chat.jid)
+			if err != nil {
+				continue
+			}
+			newName := GetChatName(client, messageStore, jid, chat.jid, nil, "", logger)
+			if newName != chat.name && newName != "" {
+				resolved++
+			}
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"resolved":   resolved,
+			"unresolved": total - resolved,
+			"total":      total,
+		})
+	})
+
+	// SSE event stream — subscribers receive all WhatsApp events in real-time
+	http.HandleFunc("/api/stream", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "SSE not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		ch := make(chan []byte, 64)
+		sseMu.Lock()
+		sseClients[ch] = struct{}{}
+		clientCount := len(sseClients)
+		sseMu.Unlock()
+
+		fmt.Printf("SSE client connected (%d total)\n", clientCount)
+
+		defer func() {
+			sseMu.Lock()
+			delete(sseClients, ch)
+			remaining := len(sseClients)
+			sseMu.Unlock()
+			fmt.Printf("SSE client disconnected (%d remaining)\n", remaining)
+		}()
+
+		// Send keepalive comment so client knows connection is live
+		fmt.Fprintf(w, ": connected\n\n")
+		flusher.Flush()
+
+		for {
+			select {
+			case data := <-ch:
+				w.Write(data)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1076,6 +1221,15 @@ func handleReceipt(client *whatsmeow.Client, messageStore *MessageStore, receipt
 	if err != nil {
 		logger.Warnf("Failed to store receipt event: %v", err)
 	}
+
+	// Broadcast to SSE subscribers
+	broadcastEvent("receipt", map[string]interface{}{
+		"chat_jid":    chatJID,
+		"sender":      sender,
+		"event_type":  eventType,
+		"message_ids": receipt.MessageIDs,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	})
 }
 
 // Handle typing indicator events
@@ -1104,6 +1258,15 @@ func handleChatPresence(messageStore *MessageStore, presence *events.ChatPresenc
 	if err != nil {
 		logger.Warnf("Failed to store typing event: %v", err)
 	}
+
+	// Broadcast to SSE subscribers
+	broadcastEvent("presence", map[string]interface{}{
+		"chat_jid":   chatJID,
+		"sender":     sender,
+		"event_type": eventType,
+		"media":      mediaType,
+		"timestamp":  time.Now().Format(time.RFC3339),
+	})
 }
 
 // MarkReadRequest for the mark-read API

@@ -29,6 +29,7 @@ from whatsapp import (
     mark_read as whatsapp_mark_read,
     send_typing as whatsapp_send_typing,
     set_presence as whatsapp_set_presence,
+    resolve_contacts as whatsapp_resolve_contacts,
 )
 
 # Initialize FastMCP server
@@ -453,6 +454,19 @@ def set_presence(available: bool = True) -> Dict[str, Any]:
         available: True = appear online, False = appear offline.
     """
     return whatsapp_set_presence(available)
+
+@mcp.tool()
+def resolve_contacts() -> Dict[str, Any]:
+    """Bulk-resolve all unresolved contact names at once.
+
+    Many contacts (especially LID-based ones) have numeric-only names in the
+    database. This triggers the Go bridge to look up real names for all of
+    them. Run once before searching contacts to ensure names are available.
+
+    Returns:
+        Object with 'resolved' count, 'unresolved' count, and 'total'.
+    """
+    return whatsapp_resolve_contacts()
 
 if __name__ == "__main__":
     # Initialize and run the server
