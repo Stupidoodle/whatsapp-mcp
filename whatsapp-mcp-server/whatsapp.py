@@ -9,7 +9,51 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(MESSAGES_DB_PATH), 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _load_lid_map() -> Dict[str, str]:
+    """{lid_user: pn_user} from whatsmeow's authoritative LID<->phone table."""
+    m: Dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(f"file:{WHATSMEOW_DB_PATH}?mode=ro", uri=True)
+        for lid, pn in conn.execute("SELECT lid, pn FROM whatsmeow_lid_map"):
+            m[lid] = pn
+        conn.close()
+    except sqlite3.Error:
+        pass
+    return m
+
+
+def alias_jids(jid: Optional[str]) -> List[str]:
+    """Every equivalent chat JID for `jid`: itself plus its LID<->phone alias.
+    WhatsApp addresses the same person by both a phone JID (…@s.whatsapp.net) and a
+    LID (…@lid). Querying the union lets a lookup by EITHER key hit the same
+    (possibly merged) thread — the two identifiers are mirrors of each other."""
+    if not jid or '@' not in jid:
+        return [jid] if jid else []
+    user, _, server = jid.partition('@')
+    out = [jid]
+    lm = _load_lid_map()
+    if server == 'lid':
+        pn = lm.get(user)
+        if pn:
+            out.append(f"{pn}@s.whatsapp.net")
+    elif server == 's.whatsapp.net':
+        for lid, pn in lm.items():
+            if pn == user:
+                out.append(f"{lid}@lid")
+                break
+    return out
+
+
+def _jid_in(col: str, jid: str) -> Tuple[str, List[str]]:
+    """('col IN (?,?)', [aliases]) matching a chat column against every alias of jid."""
+    aj = alias_jids(jid)
+    if not aj:
+        return f"{col} = ?", [jid]
+    return f"{col} IN ({','.join('?' for _ in aj)})", aj
 
 @dataclass
 class Message:
@@ -53,13 +97,14 @@ def get_sender_name(sender_jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # First try matching by exact JID
-        cursor.execute("""
+        # First try matching by exact JID (or its LID<->phone alias)
+        _in, _p = _jid_in("jid", sender_jid)
+        cursor.execute(f"""
             SELECT name
             FROM chats
-            WHERE jid = ?
+            WHERE {_in} AND name IS NOT NULL AND name != ''
             LIMIT 1
-        """, (sender_jid,))
+        """, _p)
         
         result = cursor.fetchone()
         
@@ -169,8 +214,9 @@ def list_messages(
             params.append(sender_phone_number)
             
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            _in, _p = _jid_in("messages.chat_jid", chat_jid)
+            where_clauses.append(_in)
+            params.extend(_p)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -461,6 +507,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
+        cin, cp = _jid_in("c.jid", jid)
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
@@ -471,10 +518,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender = ? OR {cin}
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """.format(cin=cin), (jid, *cp, limit, page * limit))
         
         chats = cursor.fetchall()
         
@@ -506,8 +553,9 @@ def get_last_interaction(jid: str) -> str:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
+        cin, cp = _jid_in("c.jid", jid)
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -518,10 +566,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender = ? OR {cin}
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """.format(cin=cin), (jid, *cp))
         
         msg_data = cursor.fetchone()
         
@@ -572,9 +620,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 AND c.last_message_time = m.timestamp
             """
             
-        query += " WHERE c.jid = ?"
-        
-        cursor.execute(query, (chat_jid,))
+        _in, _p = _jid_in("c.jid", chat_jid)
+        query += f" WHERE {_in}"
+
+        cursor.execute(query, tuple(_p))
         chat_data = cursor.fetchone()
         
         if not chat_data:
@@ -827,8 +876,9 @@ def get_events(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        query = "SELECT id, chat_jid, event_type, sender, timestamp, data FROM events WHERE chat_jid = ?"
-        params = [chat_jid]
+        _in, _p = _jid_in("chat_jid", chat_jid)
+        query = f"SELECT id, chat_jid, event_type, sender, timestamp, data FROM events WHERE {_in}"
+        params = list(_p)
 
         if after_timestamp:
             query += " AND timestamp > ?"
@@ -947,19 +997,22 @@ def get_chat_log(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # Get chat name
-        cursor.execute("SELECT name FROM chats WHERE jid = ?", (chat_jid,))
+        # Get chat name (match either the @lid or phone alias; prefer a real name)
+        _in, _p = _jid_in("jid", chat_jid)
+        cursor.execute(
+            f"SELECT name FROM chats WHERE {_in} ORDER BY (name IS NULL OR name='') ASC LIMIT 1", _p)
         chat_result = cursor.fetchone()
-        chat_name = chat_result[0] if chat_result else chat_jid
+        chat_name = chat_result[0] if chat_result and chat_result[0] else chat_jid
 
-        # Fetch messages (newest first, then reverse for chronological)
-        cursor.execute("""
+        # Fetch messages across all aliases (newest first, then reverse for chronological)
+        _min, _mp = _jid_in("m.chat_jid", chat_jid)
+        cursor.execute(f"""
             SELECT m.sender, m.content, m.timestamp, m.is_from_me, m.media_type, m.id
             FROM messages m
-            WHERE m.chat_jid = ?
+            WHERE {_min}
             ORDER BY m.timestamp DESC
             LIMIT ? OFFSET ?
-        """, (chat_jid, amount, offset))
+        """, (*_mp, amount, offset))
 
         messages = cursor.fetchall()
         has_more = len(messages) >= amount
@@ -1026,13 +1079,17 @@ def wait_for_reply(
     timeout_seconds = timeout_minutes * 60
     deadline = start_time + timeout_seconds
 
+    # Alias set so a reply arriving under the phone JID still matches a @lid chat_jid.
+    _aj = alias_jids(chat_jid)
+    _ph = ",".join("?" for _ in _aj)
+
     # Get the current latest message timestamp as our baseline
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?",
-            (chat_jid,)
+            f"SELECT MAX(timestamp) FROM messages WHERE chat_jid IN ({_ph})",
+            tuple(_aj)
         )
         result = cursor.fetchone()
         baseline_timestamp = result[0] if result and result[0] else datetime.now().isoformat()
@@ -1060,22 +1117,22 @@ def wait_for_reply(
             cursor = conn.cursor()
 
             # Check for incoming messages
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT m.id, m.sender, m.content, m.timestamp, m.media_type
                 FROM messages m
-                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 0
+                WHERE m.chat_jid IN ({_ph}) AND m.timestamp > ? AND m.is_from_me = 0
                 ORDER BY m.timestamp ASC
-            """, (chat_jid, baseline_timestamp))
+            """, (*_aj, baseline_timestamp))
 
             new_rows = cursor.fetchall()
 
             # Also check for outgoing messages (manual activity detection)
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT m.id, m.content, m.timestamp, m.media_type
                 FROM messages m
-                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 1
+                WHERE m.chat_jid IN ({_ph}) AND m.timestamp > ? AND m.is_from_me = 1
                 ORDER BY m.timestamp ASC
-            """, (chat_jid, baseline_timestamp))
+            """, (*_aj, baseline_timestamp))
 
             outgoing_rows = cursor.fetchall()
             conn.close()
@@ -1189,13 +1246,17 @@ def send_and_check(
     else:
         chat_jid = f"{recipient}@s.whatsapp.net"
 
+    # Alias set so a reply under the phone JID matches a @lid recipient (and vice-versa).
+    _aj = alias_jids(chat_jid)
+    _ph = ",".join("?" for _ in _aj)
+
     # Record baseline BEFORE sending
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?",
-            (chat_jid,)
+            f"SELECT MAX(timestamp) FROM messages WHERE chat_jid IN ({_ph})",
+            tuple(_aj)
         )
         result = cursor.fetchone()
         baseline_timestamp = result[0] if result and result[0] else datetime.now().isoformat()
@@ -1225,13 +1286,13 @@ def send_and_check(
         try:
             conn = sqlite3.connect(MESSAGES_DB_PATH)
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT m.sender, m.content, m.timestamp, m.media_type
                 FROM messages m
-                WHERE m.chat_jid = ? AND m.timestamp > ? AND m.is_from_me = 0
+                WHERE m.chat_jid IN ({_ph}) AND m.timestamp > ? AND m.is_from_me = 0
                 ORDER BY m.timestamp ASC
                 LIMIT 1
-            """, (chat_jid, baseline_timestamp))
+            """, (*_aj, baseline_timestamp))
 
             msg_result = cursor.fetchone()
             conn.close()
