@@ -29,6 +29,71 @@ const CONTROL_JID = process.env.WHATSAPP_CONTROL_JID || ""
 // media_failed so it asks for a resend.
 const VIEWONCE_TIMEOUT_MS = Number(process.env.WHATSAPP_VIEWONCE_TIMEOUT_MS) || 75_000
 
+// ── Operator-ask channel (ask_poll / ask_question) ────────────────────────────
+// Questions to the human operator always go to ONE fixed WhatsApp chat —
+// his "message yourself" chat — never to whoever a persona is texting. Answers come
+// back as poll votes or a "answer:" reply and are pushed into the asking session as
+// an `ask_answer` event; an unanswered ask emits `ask_timeout` so the agent moves on.
+// A push to ntfy fires the operator's phone, since self-chat messages don't notify.
+const ASK_JID = process.env.WHATSAPP_ASK_JID || CONTROL_JID
+const ASK_ANSWER_PREFIX = process.env.WHATSAPP_ASK_ANSWER_PREFIX || "answer:"
+const NTFY_BASE = (process.env.NTFY_BASE_URL || "https://ntfy.sh").replace(/\/+$/, "")
+const NTFY_TOPIC = process.env.NTFY_TOPIC || ""
+
+type Ask = {
+  id: string // the WhatsApp message id of the poll/question we sent
+  kind: "poll" | "question"
+  question: string
+  options?: string[]
+  multi?: boolean
+  timer?: ReturnType<typeof setTimeout>
+}
+// Open asks this session created, keyed by the sent message id. Only this session's
+// asks are matched, so votes/answers for another persona's polls are ignored here.
+const openAsks = new Map<string, Ask>()
+
+async function ntfyPush(title: string, body: string, tags: string): Promise<void> {
+  if (!NTFY_TOPIC) return
+  try {
+    // HTTP headers must be ASCII, so strip non-ASCII (e.g. emoji) from Title/Tags.
+    // The body is UTF-8, so any emoji in the question survives there.
+    const ascii = (s: string) => s.replace(/[^\x20-\x7E]/g, "").trim()
+    await fetch(`${NTFY_BASE}/${NTFY_TOPIC}`, {
+      method: "POST",
+      headers: { Title: ascii(title) || "Claude", Tags: ascii(tags), Priority: "default" },
+      body,
+    })
+  } catch (err) {
+    console.error(`ntfy push failed: ${err}`)
+  }
+}
+
+function clearAsk(id: string): Ask | undefined {
+  const ask = openAsks.get(id)
+  if (ask?.timer) clearTimeout(ask.timer)
+  openAsks.delete(id)
+  return ask
+}
+
+// Track an open ask and, if a timeout is given, emit `ask_timeout` when it lapses.
+// The ask stays registered after the timeout so a late tap/answer still resolves.
+function registerAsk(ask: Ask, timeoutSeconds?: number): void {
+  openAsks.set(ask.id, ask)
+  const secs = Number(timeoutSeconds)
+  if (Number.isFinite(secs) && secs > 0) {
+    ask.timer = setTimeout(() => {
+      if (!openAsks.has(ask.id)) return
+      emit(`[ask_timeout: no answer to "${ask.question}" within ${secs}s — decide yourself; a late answer still arrives if it comes]`, {
+        event_type: "ask_timeout",
+        ask_id: ask.id,
+        ask_kind: ask.kind,
+        question: ask.question,
+        ts: new Date().toISOString(),
+      })
+    }, secs * 1000)
+  }
+}
+
 // ── MCP Server + Channel Capability ──────────────────────────────────────────
 
 const server = new Server(
@@ -51,6 +116,12 @@ INCOMING EVENTS (subscribed chats only) arrive as <channel source="whatsapp" cha
 - Reaction: event_type="reaction" with target_message_id — they reacted to a message (content shows the emoji).
 - Idle: event_type="idle" minutes_idle="N" next_nudge_minutes="M" clock="<current local time>" — the chat has been quiet; the clock is the current time (use it to judge whether it's a sane hour to nudge). Re-engage only if your rules say so. After 30 quiet minutes the nudges back off on their own (the gap doubles each time).
 - Operator command: event_type="command" — the operator is instructing YOU directly (via the control chat or a "debug:" message). Carry it out; never reply to it in the chat.
+- Ask answer: event_type="ask_answer" with ask_id — the operator answered an ask_poll (selected=JSON array) or ask_question (text). Act on it.
+- Ask timeout: event_type="ask_timeout" with ask_id — the operator hasn't answered your ask within the timeout you set. Stop waiting and decide yourself using your other tools/chats; a late answer still arrives as ask_answer if they get to it.
+
+ASKING THE OPERATOR — use ask_poll (preferred) / ask_question INSTEAD of stopping. They go to the operator's own chat, never to the person you're texting, and never block:
+- ask_poll(question, options, multi_select?, timeout_seconds?)  multiple-choice; answer returns as an ask_answer event
+- ask_question(question, timeout_seconds?)                      free-text; operator replies "answer: ..." or quote-replies
 
 REPLYING — address by alias, or omit "to" for the sole subscribed target. Never type a raw number:
 - reply(text, to?)                        send a text message
@@ -319,6 +390,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "ask_poll",
+      description:
+        "Ask the OPERATOR (the human running you) a multiple-choice question via a WhatsApp poll to their own chat, plus a phone push. This is your replacement for AskUserQuestions — prefer it. It does NOT go to the person you're texting, and it does NOT block: it returns a poll_id right away, and the answer arrives later as an `ask_answer` event (with `selected`). Set `timeout_seconds` from context — short (e.g. 60) when you're mid-conversation and time-sensitive, long or omitted when it can wait. On timeout you get an `ask_timeout` event and should decide yourself using your other tools (other chats, other MCP tools); a late answer still arrives if they tap it. Unanswered polls are fine.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          question: { type: "string", description: "The question to show the operator" },
+          options: { type: "array", items: { type: "string" }, description: "2–12 answer options" },
+          multi_select: { type: "boolean", description: "Allow choosing more than one option (default false)" },
+          timeout_seconds: { type: "number", description: "Emit ask_timeout after this many seconds if unanswered (omit for no timeout)" },
+        },
+        required: ["question", "options"],
+      },
+    },
+    {
+      name: "ask_question",
+      description:
+        "Ask the OPERATOR an open (free-text) question via WhatsApp to their own chat, plus a phone push. Like ask_poll but for answers that aren't multiple-choice. Non-blocking: returns a question id; the operator answers by replying \"answer: <text>\" or quote-replying, and it arrives as an `ask_answer` event (with `text`). Set `timeout_seconds` from context; on timeout you get `ask_timeout` and decide yourself. Prefer ask_poll when the answer fits a few options.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          question: { type: "string", description: "The question to show the operator" },
+          timeout_seconds: { type: "number", description: "Emit ask_timeout after this many seconds if unanswered (omit for no timeout)" },
+        },
+        required: ["question"],
+      },
+    },
   ],
 }))
 
@@ -366,6 +465,44 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     switch (name) {
+      case "ask_poll": {
+        if (!ASK_JID) return text("refused: no operator ask chat configured (set WHATSAPP_ASK_JID)", true)
+        const options: string[] = Array.isArray(a.options) ? a.options.map(String) : []
+        if (options.length < 2) return text("refused: ask_poll needs at least 2 options", true)
+        if (options.length > 12) return text("refused: WhatsApp allows at most 12 poll options", true)
+        const multi = a.multi_select === true
+        const result = await bridgePost("/api/poll", {
+          recipient: ASK_JID,
+          name: a.question,
+          options,
+          selectable_count: multi ? options.length : 1,
+        })
+        if (!result.success || !result.message_id) return text(`failed: ${result.message || "poll not sent"}`, true)
+        const id = String(result.message_id)
+        registerAsk({ id, kind: "poll", question: a.question, options, multi }, a.timeout_seconds)
+        await ntfyPush("Claude asks", `${a.question}\n${options.map((o) => `• ${o}`).join("\n")}`, "question,ballot_box")
+        return text(`poll sent to you; poll_id=${id}. I'll get an ask_answer event when you tap${multi ? " (multi-select)" : ""}, or ask_timeout if not.`)
+      }
+
+      case "ask_question": {
+        if (!ASK_JID) return text("refused: no operator ask chat configured (set WHATSAPP_ASK_JID)", true)
+        const result = await bridgePost("/api/send", {
+          recipient: ASK_JID,
+          message: `❓ ${a.question}\n\n(reply "${ASK_ANSWER_PREFIX} ..." or quote-reply this)`,
+        })
+        if (!result.success) return text(`failed: ${result.message || "question not sent"}`, true)
+        // The bridge's /api/send doesn't return the message id, so pin it via the store.
+        let id = ""
+        try {
+          const ids = await bridgePost("/api/messages", { chat_jid: ASK_JID, filter: a.question.slice(0, 40), limit: 1 })
+          id = ids?.messages?.[0]?.id || ""
+        } catch {}
+        if (!id) id = `q-${Date.now()}` // fallback key; quote-reply won't match but prefix will
+        registerAsk({ id, kind: "question", question: a.question }, a.timeout_seconds)
+        await ntfyPush("Claude asks", a.question, "question,speech_balloon")
+        return text(`question sent to you; question_id=${id}. Reply "${ASK_ANSWER_PREFIX} ..." (or quote-reply). I'll get an ask_answer event, or ask_timeout if not.`)
+      }
+
       case "subscribe": {
         // Canonicalize so a phone/@lid subscription lands on the same key the bridge
         // emits for this contact's events (the LID split-chat fix).
@@ -518,9 +655,68 @@ async function autoCaptureViewOnce(messageId: string, jid: string, alias: string
   }
 }
 
+// Digits of a JID's user part, for comparing the operator ask chat to event chats
+// regardless of @s.whatsapp.net/@lid form.
+function jidDigits(jid: string): string {
+  return (jid.split("@")[0] || jid).replace(/\D/g, "")
+}
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+// Resolve an operator answer to one of THIS session's open asks. Returns true if the
+// event was consumed as an ask response (so it isn't also surfaced as a normal event).
+function handleAskResponse(eventType: string, data: any, chatId: string): boolean {
+  // A poll vote is matched purely by the poll id we sent — no chat-subscription needed.
+  if (eventType === "poll_vote") {
+    const pollId = String(data.poll_message_id || "")
+    if (!openAsks.has(pollId)) return false
+    const ask = clearAsk(pollId)!
+    const selected: string[] = Array.isArray(data.selected_options) ? data.selected_options : []
+    emit(`[ask_answer to "${ask.question}": ${selected.length ? selected.join(", ") : "(vote could not be read)"}]`, {
+      event_type: "ask_answer",
+      ask_id: ask.id,
+      ask_kind: "poll",
+      question: ask.question,
+      selected: JSON.stringify(selected),
+      ts: data.timestamp || new Date().toISOString(),
+    })
+    return true
+  }
+  // A free-text answer: the operator's own message in the ask chat, either a
+  // quote-reply of the question (exact) or one prefixed "answer:" (most recent open).
+  if (eventType === "message" && data.is_from_me && ASK_JID && openAsks.size > 0 && jidDigits(chatId) === jidDigits(ASK_JID)) {
+    const body: string = data.content || ""
+    const quoted = String(data.quoted_message_id || "")
+    let ask = quoted && openAsks.has(quoted) ? openAsks.get(quoted) : undefined
+    const hasPrefix = body.trimStart().toLowerCase().startsWith(ASK_ANSWER_PREFIX.toLowerCase())
+    if (!ask && hasPrefix) {
+      const questions = [...openAsks.values()].filter((k) => k.kind === "question")
+      ask = questions[questions.length - 1] // most recent open free-text ask
+    }
+    if (!ask) return false
+    const answer = body.replace(new RegExp("^\\s*" + escapeRegExp(ASK_ANSWER_PREFIX), "i"), "").trim()
+    clearAsk(ask.id)
+    emit(`[ask_answer to "${ask.question}": ${answer}]`, {
+      event_type: "ask_answer",
+      ask_id: ask.id,
+      ask_kind: ask.kind,
+      question: ask.question,
+      text: answer,
+      ts: data.timestamp || new Date().toISOString(),
+    })
+    return true
+  }
+  return false
+}
+
 function handleEvent(eventType: string, data: any) {
   const chatId = data.chat_jid || ""
   if (chatId.includes("@broadcast") || chatId === "status@s.whatsapp.net") return
+
+  // Operator-ask responses (poll votes / "answer:" replies) resolve here, ahead of
+  // the subscription filter, since the ask chat is the operator's own chat.
+  if (handleAskResponse(eventType, data, chatId)) return
 
   const resolvedChat = isSubscribed(chatId, data.message_ids)
   if (!resolvedChat) {

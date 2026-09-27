@@ -25,6 +25,10 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWa6"
+	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -393,6 +397,15 @@ func NewMessageStore() (*MessageStore, error) {
 			timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			data TEXT
 		);
+
+		-- Poll option names keyed by the poll's message ID. whatsmeow stores the
+		-- message secret on send (so votes decrypt), but a vote only carries SHA256
+		-- hashes of the chosen options; we keep the names here to reverse them.
+		CREATE TABLE IF NOT EXISTS poll_options (
+			poll_id TEXT PRIMARY KEY,
+			chat_jid TEXT,
+			options TEXT
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -514,6 +527,14 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// PollRequest is the request body for the /api/poll endpoint.
+type PollRequest struct {
+	Recipient       string   `json:"recipient"`
+	Name            string   `json:"name"`    // the poll question
+	Options         []string `json:"options"` // 2–12 answer options
+	SelectableCount int      `json:"selectable_count,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -874,6 +895,22 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Surface poll votes as their own event (they carry no text/media, only
+	// encrypted option hashes). Store options on creation so votes resolve to names.
+	if create := msg.Message.GetPollCreationMessage(); create != nil {
+		names := make([]string, len(create.GetOptions()))
+		for i, opt := range create.GetOptions() {
+			names[i] = opt.GetOptionName()
+		}
+		if err := messageStore.StorePollOptions(msg.Info.ID, chatJID, names); err != nil {
+			logger.Warnf("Failed to store poll options for %s: %v", msg.Info.ID, err)
+		}
+		return
+	}
+	if handlePollVote(client, messageStore, msg, chatJID, sender, name, logger) {
+		return
+	}
+
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
@@ -927,6 +964,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			"media_type":  mediaType,
 			"filename":    filename,
 			"view_once":   msg.IsViewOnce,
+			// StanzaID of a quoted message when this is a quote-reply (else ""),
+			// so the operator-ask flow can route a quoted "answer:" to its question.
+			"quoted_message_id": msg.Message.GetExtendedTextMessage().GetContextInfo().GetStanzaID(),
 		})
 	}
 }
@@ -967,6 +1007,19 @@ func handleUndecryptable(client *whatsmeow.Client, messageStore *MessageStore, v
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
 	ChatJID   string `json:"chat_jid"`
+}
+
+// RerequestRequest asks our primary phone to re-deliver a message that reached
+// this companion without an <enc> payload (e.g. a view-once fanout placeholder).
+// The phone still holds the plaintext for as long as the message is unopened
+// there, so this is the only route to content the server withheld from us.
+type RerequestRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	SenderJID string `json:"sender_jid,omitempty"`
+	MessageID string `json:"message_id"`
+	Mode      string `json:"mode,omitempty"`
+	Count     int    `json:"count,omitempty"`
+	Timestamp int64  `json:"timestamp,omitempty"`
 }
 
 // RevokeRequest unsends (deletes for everyone) one of our own messages.
@@ -1305,6 +1358,39 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for sending a poll (a question with tappable options)
+	http.HandleFunc("/api/poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req PollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.Name == "" || len(req.Options) < 2 {
+			http.Error(w, "recipient, name and at least 2 options are required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Options) > 12 {
+			http.Error(w, "WhatsApp allows at most 12 poll options", http.StatusBadRequest)
+			return
+		}
+		selectable := req.SelectableCount
+		if selectable <= 0 {
+			selectable = 1 // single-choice by default
+		}
+		success, message := sendPoll(client, messageStore, req.Recipient, req.Name, req.Options, selectable)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: message})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message_id": message})
+	})
+
 	// Handler for unsending (revoking) one of our own messages
 	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -1326,6 +1412,84 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Handler for asking our phone to re-deliver an undecryptable message.
+	// mode="placeholder" sends a PLACEHOLDER_MESSAGE_RESEND peer request (the same
+	// thing AutomaticMessageRerequestFromPhone fires once, automatically, at receipt
+	// time); mode="history" asks for an on-demand history chunk ending at the given
+	// message. Both answer asynchronously - the redelivered message arrives through
+	// the normal events.Message path, so watch the stream or the store for it.
+	http.HandleFunc("/api/rerequest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RerequestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			http.Error(w, "Invalid chat_jid", http.StatusBadRequest)
+			return
+		}
+		// For a 1:1 chat the sender is the chat itself unless caller overrides it
+		// (the LID and phone-number JIDs address the same person, and which one the
+		// phone indexed the message under is exactly what we may need to probe).
+		sender := chat
+		if req.SenderJID != "" {
+			sender, err = types.ParseJID(req.SenderJID)
+			if err != nil {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		}
+
+		mode := req.Mode
+		if mode == "" {
+			mode = "placeholder"
+		}
+		var peerMsg *waE2E.Message
+		switch mode {
+		case "placeholder":
+			peerMsg = client.BuildUnavailableMessageRequest(chat, sender, req.MessageID)
+		case "history":
+			count := req.Count
+			if count <= 0 {
+				count = 50
+			}
+			ts := time.Now()
+			if req.Timestamp > 0 {
+				ts = time.Unix(req.Timestamp, 0)
+			}
+			peerMsg = client.BuildHistorySyncRequest(&types.MessageInfo{
+				MessageSource: types.MessageSource{Chat: chat, Sender: sender},
+				ID:            req.MessageID,
+				Timestamp:     ts,
+			}, count)
+		default:
+			http.Error(w, "mode must be \"placeholder\" or \"history\"", http.StatusBadRequest)
+			return
+		}
+
+		resp, err := client.SendPeerMessage(context.Background(), peerMsg)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: fmt.Sprintf("peer request failed: %v", err)})
+			return
+		}
+		fmt.Printf("Sent %s re-request for %s in %s (stanza %s)\n", mode, req.MessageID, chat, resp.ID)
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("%s re-request sent for %s (stanza %s); redelivery arrives asynchronously", mode, req.MessageID, resp.ID),
+		})
 	})
 
 	// Handler for editing one of our own messages
@@ -1807,10 +1971,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Fprintf(w, ": connected\n\n")
 		flusher.Flush()
 
+		// Heartbeat. Without it the stream is silent between messages, and a
+		// client whose HTTP layer has an idle timeout tears the connection
+		// down and reconnects -- which produced a TimeoutError every few
+		// minutes in the channel server and a reconnect storm in the log.
+		heartbeat := time.NewTicker(20 * time.Second)
+		defer heartbeat.Stop()
+
 		for {
 			select {
 			case data := <-ch:
 				w.Write(data)
+				flusher.Flush()
+			case <-heartbeat.C:
+				fmt.Fprintf(w, ": keepalive\n\n")
 				flusher.Flush()
 			case <-r.Context().Done():
 				return
@@ -1837,6 +2011,111 @@ func (store *MessageStore) StoreEvent(chatJID, eventType, sender, data string) e
 		chatJID, eventType, sender, time.Now().Format(time.RFC3339), data,
 	)
 	return err
+}
+
+// StorePollOptions remembers a poll's option names so incoming votes (which carry
+// only SHA256 hashes of the chosen options) can be mapped back to names.
+func (store *MessageStore) StorePollOptions(pollID, chatJID string, options []string) error {
+	blob, err := json.Marshal(options)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec(
+		"INSERT OR REPLACE INTO poll_options (poll_id, chat_jid, options) VALUES (?, ?, ?)",
+		pollID, chatJID, string(blob),
+	)
+	return err
+}
+
+// GetPollOptions returns the stored option names for a poll, or nil if unknown.
+func (store *MessageStore) GetPollOptions(pollID string) []string {
+	var blob string
+	if err := store.db.QueryRow("SELECT options FROM poll_options WHERE poll_id = ?", pollID).Scan(&blob); err != nil {
+		return nil
+	}
+	var options []string
+	if json.Unmarshal([]byte(blob), &options) != nil {
+		return nil
+	}
+	return options
+}
+
+// resolvePollVote maps a decrypted vote's option hashes back to their names, using
+// the stored option list for the poll. Unknown hashes are dropped.
+func resolvePollVote(options []string, selected [][]byte) []string {
+	hashes := whatsmeow.HashPollOptions(options)
+	var chosen []string
+	for _, sel := range selected {
+		for i, h := range hashes {
+			if bytes.Equal(sel, h) {
+				chosen = append(chosen, options[i])
+			}
+		}
+	}
+	return chosen
+}
+
+// handlePollVote decrypts a poll vote and broadcasts it as a "poll_vote" SSE event.
+// Returns true if the message was a poll vote (handled).
+func handlePollVote(client *whatsmeow.Client, store *MessageStore, msg *events.Message, chatJID, sender, name string, logger waLog.Logger) bool {
+	update := msg.Message.GetPollUpdateMessage()
+	if update == nil {
+		return false
+	}
+	pollID := update.GetPollCreationMessageKey().GetID()
+	vote, err := client.DecryptPollVote(context.Background(), msg)
+	if err != nil {
+		logger.Warnf("Failed to decrypt poll vote for poll %s: %v", pollID, err)
+		broadcastEvent("poll_vote", map[string]interface{}{
+			"chat_jid":        chatJID,
+			"sender":          sender,
+			"sender_name":     name,
+			"poll_message_id": pollID,
+			"message_id":      msg.Info.ID,
+			"error":           "decrypt_failed",
+			"timestamp":       msg.Info.Timestamp.Format(time.RFC3339),
+			"is_from_me":      msg.Info.IsFromMe,
+		})
+		return true
+	}
+	options := store.GetPollOptions(pollID)
+	selected := resolvePollVote(options, vote.GetSelectedOptions())
+	logger.Infof("Poll vote from %s on poll %s: %v", sender, pollID, selected)
+	broadcastEvent("poll_vote", map[string]interface{}{
+		"chat_jid":         chatJID,
+		"sender":           sender,
+		"sender_name":      name,
+		"poll_message_id":  pollID,
+		"message_id":       msg.Info.ID,
+		"selected_options": selected,
+		"selected_count":   len(vote.GetSelectedOptions()),
+		"timestamp":        msg.Info.Timestamp.Format(time.RFC3339),
+		"is_from_me":       msg.Info.IsFromMe,
+	})
+	return true
+}
+
+// sendPoll sends a poll message and stores its options for vote resolution.
+func sendPoll(client *whatsmeow.Client, store *MessageStore, recipient, name string, options []string, selectableCount int) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	if !recipientAllowed(recipient) {
+		return false, "recipient not in WHATSAPP_ALLOWED_RECIPIENTS"
+	}
+	recipientJID, err := parseRecipientJID(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+	poll := client.BuildPollCreation(name, options, selectableCount)
+	resp, err := client.SendMessage(context.Background(), recipientJID, poll)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending poll: %v", err)
+	}
+	if err := store.StorePollOptions(resp.ID, recipientJID.String(), options); err != nil {
+		fmt.Printf("Warning: poll %s sent but options not stored: %v\n", resp.ID, err)
+	}
+	return true, resp.ID
 }
 
 // Handle receipt events (read, delivered, played)
@@ -1947,8 +2226,54 @@ type PresenceRequest struct {
 
 func main() {
 	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	// Log level is env-driven so a wire-level trace (WA_LOG_LEVEL=DEBUG) can be
+	// captured without a rebuild. DEBUG dumps every received node via the Recv
+	// sub-logger, which is how view-once fanout stanzas become visible.
+	logLevel := os.Getenv("WA_LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "INFO"
+	}
+	logger := waLog.Stdout("Client", logLevel, true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// DeviceProps is sent ONLY in the registration node, i.e. at pairing time. A
+	// device registered as whatsmeow/UNKNOWN cannot be re-labelled by reconnecting,
+	// so this has no effect on an existing session - it only changes how a NEW
+	// pairing identifies itself. Baileys' Browsers.windows("Desktop") yields
+	// Os="Windows" + PlatformType=DESKTOP, and a Baileys maintainer reports
+	// companions receiving view-once media; whatsmeow's whatsmeow/UNKNOWN default
+	// is the last remaining difference between the two.
+	if os.Getenv("WA_DEVICE_IDENTITY") == "DESKTOP" {
+		wastore.DeviceProps.Os = proto.String("Windows")
+		wastore.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+		logger.Infof("Device identity set to Windows/DESKTOP (takes effect only on a NEW pairing)")
+	}
+
+	// WhatsApp gates some companion-device features on the advertised web
+	// sub-platform, which travels in ClientPayload.WebInfo - a per-connection
+	// field, so this applies on reconnect and needs no re-pairing. whatsmeow
+	// defaults to WEB_BROWSER; WIN_HYBRID (5) is the identity of the modern
+	// native Windows Desktop app, which unlike this bridge CAN open view-once
+	// media. Baileys hit the same wall for full history sync (their #2741).
+	// Unset = unchanged upstream behaviour, so reverting is a restart.
+	if sp := os.Getenv("WA_WEB_SUBPLATFORM"); sp != "" {
+		subPlatforms := map[string]waWa6.ClientPayload_WebInfo_WebSubPlatform{
+			"WEB_BROWSER": waWa6.ClientPayload_WebInfo_WEB_BROWSER,
+			"APP_STORE":   waWa6.ClientPayload_WebInfo_APP_STORE,
+			"WIN_STORE":   waWa6.ClientPayload_WebInfo_WIN_STORE,
+			"DARWIN":      waWa6.ClientPayload_WebInfo_DARWIN,
+			"WIN32":       waWa6.ClientPayload_WebInfo_WIN32,
+			"WIN_HYBRID":  waWa6.ClientPayload_WebInfo_WIN_HYBRID,
+		}
+		v, ok := subPlatforms[strings.ToUpper(sp)]
+		if !ok {
+			logger.Errorf("Unknown WA_WEB_SUBPLATFORM %q - refusing to start rather than "+
+				"connecting with an identity you did not choose", sp)
+			return
+		}
+		wastore.BaseClientPayload.WebInfo.WebSubPlatform = v.Enum()
+		logger.Infof("Advertising web sub-platform %s", strings.ToUpper(sp))
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
