@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js"
+import { INSTRUCTIONS } from "./instructions"
 
 const GO_BRIDGE = process.env.GO_BRIDGE_URL || "http://localhost:8080"
 // Idle re-engagement heartbeat in minutes. Unset/blank/garbage → 5; explicit 0 disables.
@@ -103,39 +104,7 @@ const server = new Server(
       tools: {},
       experimental: { "claude/channel": {} },
     },
-    instructions: `WhatsApp bridge channel. Conversations are addressed by a short ALIAS (e.g. "alex") — you never see or type a phone number.
-
-INCOMING EVENTS (subscribed chats only) arrive as <channel source="whatsapp" chat="<alias>" ...>:
-- Message: attributes chat, user, message_id, ts. Media adds media_type/filename (and view_once="true" if it was a disappearing message) — use download_attachment to view it.
-  When a message event arrives it's your turn: reply right away with the reply tool. No artificial delays.
-- View-once saved: event_type="view_once_saved" with a path attribute — a disappearing photo/video was auto-downloaded to the session folder. Read that path to see it (it won't be re-fetchable later).
-- Media pending: event_type="media_pending" — she sent a photo/video that arrived encrypted-but-unreadable (often view-once) and is being re-fetched from her phone. You CANNOT see it yet. React naturally to the fact she sent something ("ooo hold on" / "loading…"). Then WAIT — do NOT keep asking. Either the real media arrives as a later event, or you get a media_failed event telling you it's gone. Do NOT pretend you saw it.
-- Media failed: event_type="media_failed" — a pending photo/video (usually view-once) could NOT be retrieved and never will. Stop waiting. Ask her to resend it, naturally and once ("ey das kam nich durch, schick nochmal?"). A resend usually arrives as normal media you CAN see.
-- Receipt: event_type="read"|"delivered"|"played" — feedback that your message landed; usually no action needed.
-- Typing: event_type="typing"|"typing_stopped".
-- Reaction: event_type="reaction" with target_message_id — they reacted to a message (content shows the emoji).
-- Idle: event_type="idle" minutes_idle="N" next_nudge_minutes="M" clock="<current local time>" — the chat has been quiet; the clock is the current time (use it to judge whether it's a sane hour to nudge). Re-engage only if your rules say so. After 30 quiet minutes the nudges back off on their own (the gap doubles each time).
-- Operator command: event_type="command" — the operator is instructing YOU directly (via the control chat or a "debug:" message). Carry it out; never reply to it in the chat.
-- Ask answer: event_type="ask_answer" with ask_id — the operator answered an ask_poll (selected=JSON array) or ask_question (text). Act on it.
-- Ask timeout: event_type="ask_timeout" with ask_id — the operator hasn't answered your ask within the timeout you set. Stop waiting and decide yourself using your other tools/chats; a late answer still arrives as ask_answer if they get to it.
-
-ASKING THE OPERATOR — use ask_poll (preferred) / ask_question INSTEAD of stopping. They go to the operator's own chat, never to the person you're texting, and never block:
-- ask_poll(question, options, multi_select?, timeout_seconds?)  multiple-choice; answer returns as an ask_answer event
-- ask_question(question, timeout_seconds?)                      free-text; operator replies "answer: ..." or quote-replies
-
-REPLYING — address by alias, or omit "to" for the sole subscribed target. Never type a raw number:
-- reply(text, to?)                        send a text message
-- send_file(file_path, to?)               send an image/video/document
-- send_audio(file_path, to?)              send a voice message
-- send_typing(to?, composing?, media?)    optional "typing…"/"recording…" indicator
-- mark_read(message_ids, to?)             optional read receipts
-- download_attachment(message_id, to?)    fetch media so you can view it
-- get_message_ids(to?, filter?, limit?)   list your OWN recent sent messages + their ids (for unsend/edit; filter to pin one)
-- unsend(message_id, to?)                  retract one of YOUR messages (fix a bad/wrong send) — id via get_message_ids
-- edit(message_id, text, to?)              edit one of YOUR messages — id via get_message_ids
-- react(message_id, emoji, to?)            react to a message with an emoji
-- set_idle(minutes, to?)                    tune your idle-nudge cadence — ramp up to back off (60 = hourly), 0 to pause; auto-resets to default when she replies
-- subscribe(chat_id, alias?) / unsubscribe(to) / list_subscriptions   manage streamed chats`,
+    instructions: INSTRUCTIONS,
   }
 )
 
